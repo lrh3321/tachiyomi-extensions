@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.SharedPreferences
 import android.net.Uri
 import androidx.preference.CheckBoxPreference
+import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.GET
@@ -28,6 +29,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
+import okhttp3.internal.http.HTTP_FORBIDDEN
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import rx.Observable
@@ -43,6 +45,8 @@ class Manwa : ParsedHttpSource(), ConfigurableSource {
     override val lang: String = "zh"
     override val supportsLatest: Boolean = true
     override val baseUrl = "https://manwa.me"
+
+    private var baseHost = "manwa.me"
     private val json: Json by injectLazy()
     private val preferences: SharedPreferences =
         Injekt.get<Application>().getSharedPreferences("source_$id", 0x0000)
@@ -66,14 +70,24 @@ class Manwa : ParsedHttpSource(), ConfigurableSource {
         }
     }
 
+    private val redirectDetect: Interceptor = Interceptor { chain ->
+        val originalResponse: Response = chain.proceed(chain.request())
+        if (originalResponse.code == HTTP_FORBIDDEN) {
+            throw Exception("wrong base url")
+        } else {
+            originalResponse
+        }
+    }
+
     override val client: OkHttpClient = network.client.newBuilder()
         .addNetworkInterceptor(rewriteOctetStream)
+        .addInterceptor(redirectDetect)
         .build()
 
-    private val baseHttpUrl = baseUrl.toHttpUrlOrNull()
+    private var baseHttpUrl = baseUrl.toHttpUrlOrNull()!!
 
     // Popular
-    override fun popularMangaRequest(page: Int) = GET("$baseUrl/rank", headers)
+    override fun popularMangaRequest(page: Int) = GET("$SCHEME$baseHost/rank", headers)
     override fun popularMangaNextPageSelector(): String? = null
     override fun popularMangaSelector(): String = "#rankList_2 > a"
     override fun popularMangaFromElement(element: Element): SManga = SManga.create().apply {
@@ -83,12 +97,24 @@ class Manwa : ParsedHttpSource(), ConfigurableSource {
     }
 
     // Latest
-    override fun latestUpdatesRequest(page: Int) = GET("$baseUrl/getUpdate?page=${page * 15 - 15}&date=", headers)
+    override fun latestUpdatesRequest(page: Int) =
+        GET("$SCHEME$baseHost/getUpdate?page=${page * 15 - 15}&date=", headers)
+
     override fun latestUpdatesParse(response: Response): MangasPage {
         // Get image host
-        val resp = client.newCall(GET("$baseUrl/update?img_host=${preferences.getString(IMAGE_HOST_KEY, IMAGE_HOST_ENTRY_VALUES[0])}")).execute()
+        val resp = client.newCall(
+            GET(
+                "$SCHEME$baseHost/update?img_host=${
+                preferences.getString(
+                    IMAGE_HOST_KEY,
+                    IMAGE_HOST_ENTRY_VALUES[0],
+                )
+                }",
+            ),
+        ).execute()
         val document = resp.asJsoup()
-        val imgHost = document.selectFirst(".manga-list-2-cover-img")!!.attr(":src").drop(1).substringBefore("'")
+        val imgHost = document.selectFirst(".manga-list-2-cover-img")!!.attr(":src").drop(1)
+            .substringBefore("'")
 
         val jsonObject = json.parseToJsonElement(response.body.string()).jsonObject
         val mangas = jsonObject["books"]!!.jsonArray.map {
@@ -100,7 +126,8 @@ class Manwa : ParsedHttpSource(), ConfigurableSource {
             }
         }
 
-        val currentPage = response.request.url.toString().substringAfter("page=").substringBefore("&").toInt()
+        val currentPage =
+            response.request.url.toString().substringAfter("page=").substringBefore("&").toInt()
         val totalPage = jsonObject["total"]!!.jsonPrimitive.int
         return MangasPage(mangas, totalPage > currentPage + 15)
     }
@@ -112,7 +139,7 @@ class Manwa : ParsedHttpSource(), ConfigurableSource {
     // Search
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val uri = Uri.parse(baseUrl).buildUpon()
+        val uri = Uri.parse(SCHEME + baseHost).buildUpon()
         uri.appendPath("search")
             .appendQueryParameter("keyword", query)
         return GET(uri.toString(), headers)
@@ -131,9 +158,11 @@ class Manwa : ParsedHttpSource(), ConfigurableSource {
     override fun mangaDetailsParse(document: Document): SManga = SManga.create().apply {
         title = document.selectFirst(".detail-main-info-title")!!.text()
         thumbnail_url = document.selectFirst("div.detail-main-cover > img")!!.attr("data-original")
-        author = document.select("p.detail-main-info-author > span.detail-main-info-value > a").text()
+        author =
+            document.select("p.detail-main-info-author > span.detail-main-info-value > a").text()
         artist = author
-        genre = document.select("div.detail-main-info-class > a.info-tag").eachText().joinToString(", ")
+        genre =
+            document.select("div.detail-main-info-class > a.info-tag").eachText().joinToString(", ")
         description = document.selectFirst("#detail > p.detail-desc")!!.text()
     }
 
@@ -150,13 +179,21 @@ class Manwa : ParsedHttpSource(), ConfigurableSource {
     }
 
     override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
-        client.newCall(GET("$baseUrl/static/images/pv.gif")).execute()
+        client.newCall(GET("$SCHEME$baseHost/static/images/pv.gif")).execute()
         return super.fetchPageList(chapter)
     }
 
     // Pages
     override fun pageListRequest(chapter: SChapter): Request {
-        return GET("$baseUrl${chapter.url}?img_host=${preferences.getString(IMAGE_HOST_KEY, IMAGE_HOST_ENTRY_VALUES[0])}", headers)
+        return GET(
+            "$SCHEME$baseHost${chapter.url}?img_host=${
+            preferences.getString(
+                IMAGE_HOST_KEY,
+                IMAGE_HOST_ENTRY_VALUES[0],
+            )
+            }",
+            headers,
+        )
     }
 
     override fun pageListParse(document: Document): List<Page> = mutableListOf<Page>().apply {
@@ -195,25 +232,41 @@ class Manwa : ParsedHttpSource(), ConfigurableSource {
 
             setDefaultValue(false)
         }.let { screen.addPreference(it) }
+
+        EditTextPreference(screen.context).apply {
+            key = BASE_HOST_KEY
+            title = "Host"
+
+            setDefaultValue(baseHost)
+            setOnPreferenceChangeListener { _, newValue ->
+                val url = (SCHEME + newValue as String).toHttpUrlOrNull()
+                    ?: return@setOnPreferenceChangeListener false
+                this@Manwa.baseHost = newValue
+                this@Manwa.baseHttpUrl = url
+                true
+            }
+        }.let { screen.addPreference(it) }
     }
 
     private fun clearCookies() {
-        if (baseHttpUrl == null) {
-            return
-        }
-        val cookies = client.cookieJar.loadForRequest(baseHttpUrl)
+        val url = baseHttpUrl
+        val cookies = client.cookieJar.loadForRequest(url)
         val obsoletedCookies = cookies.map {
-            val cookie = Cookie.parse(baseHttpUrl, "${it.name}=; Max-Age=-1")!!
+            val cookie = Cookie.parse(url, "${it.name}=; Max-Age=-1")!!
             cookie
         }
-        client.cookieJar.saveFromResponse(baseHttpUrl, obsoletedCookies)
+        client.cookieJar.saveFromResponse(url, obsoletedCookies)
     }
 
     companion object {
+        private const val SCHEME = "https://"
+
         private const val IMAGE_HOST_KEY = "IMG_HOST"
         private val IMAGE_HOST_ENTRIES = arrayOf("图源1", "图源2", "图源3")
         private val IMAGE_HOST_ENTRY_VALUES = arrayOf("1", "2", "3")
 
         private const val AUTO_CLEAR_COOKIE_KEY = "CLEAR_COOKIE"
+
+        private const val BASE_HOST_KEY = "BASE_HOST"
     }
 }
